@@ -164,16 +164,12 @@ if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
     fi
 
     step "Configuring GPSD"
-    cat > /etc/default/gpsd <<'GPSDCONF'
-# PTPScope — GPSD configuration
-DEVICES="/dev/serial0"
-GPSD_OPTIONS="-n"
-GPSD_SOCKET="/var/run/gpsd.sock"
-START_DAEMON="true"
-USBAUTO="false"
-GPSDCONF
-    ok "GPSD configured for /dev/serial0"
-    systemctl enable gpsd 2>/dev/null && ok "GPSD service enabled" || warn "Could not enable GPSD"
+    # PTPScope reads the GPS serial port directly and writes to NTP SHM
+    # itself, so GPSD must be disabled to avoid port conflicts.
+    systemctl stop gpsd gpsd.socket 2>/dev/null
+    systemctl disable gpsd gpsd.socket 2>/dev/null
+    systemctl mask gpsd gpsd.socket 2>/dev/null
+    ok "GPSD disabled (PTPScope writes NTP SHM directly)"
 fi
 
 # ── Configure Chrony ──────────────────────────────────────────────────────────
@@ -196,7 +192,7 @@ if [[ -f "$CHRONY_CONF" ]]; then
             cat >> "$CHRONY_CONF" <<'CHRONYAPPEND'
 
 # ── PTPScope GPS + PPS configuration ────────────────────────────────────────
-# GPS via shared memory from GPSD
+# GPS via shared memory — written by PTPScope directly (not GPSD)
 refclock SHM 0 refid GPS precision 1e-1 offset 0.0 delay 0.2 noselect
 # PPS from kernel PPS driver — locked to GPS for coarse time
 refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS
@@ -226,13 +222,26 @@ CHRONYAPPEND
         fi
     fi
 
+    # Chrony runs as _chrony by default, which can't read SHM segments
+    # created by PTPScope (running as root).  Override to run as root.
+    if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
+        mkdir -p /etc/systemd/system/chronyd.service.d
+        cat > /etc/systemd/system/chronyd.service.d/ptpscope.conf <<'CHRONYDROP'
+[Service]
+User=root
+Group=root
+CHRONYDROP
+        systemctl daemon-reload
+        ok "Chrony configured to run as root (for SHM access)"
+    fi
+
     # On GPS Source nodes the PPS refclock requires /dev/pps0 which only
     # appears after a reboot (dtoverlay=pps-gpio was just added above).
     # Chrony will refuse to start until that device exists.
     if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]] && [[ ! -e /dev/pps0 ]]; then
         info "Chrony restart deferred — /dev/pps0 not available until reboot"
     else
-        systemctl restart chrony 2>/dev/null && ok "Chrony restarted" || warn "Could not restart chrony"
+        systemctl restart chronyd 2>/dev/null && ok "Chrony restarted" || warn "Could not restart chrony"
     fi
 else
     warn "Chrony config not found — please configure manually"

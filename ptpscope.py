@@ -3,7 +3,7 @@
 # PTPScope — GPS PTP Grandmaster for Raspberry Pi
 # Single-file Flask application with embedded templates
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD = "PTPScope-1.2.0"
+BUILD = "PTPScope-1.3.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
@@ -1229,6 +1229,130 @@ def login_required(f):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  NTP SHM WRITER — feeds GPS time directly to chrony, replacing GPSD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NtpShmWriter:
+    """Write GPS timestamps to chrony's NTP shared memory segment (SHM 0).
+
+    This replaces GPSD's role in the NTP pipeline.  PTPScope reads the GPS
+    serial port directly, so GPSD can never access it.  Instead, PTPScope
+    writes to the same SysV SHM segment that chrony's ``refclock SHM 0``
+    reads, giving chrony a coarse-time GPS reference that PPS can lock to.
+
+    SHM layout (96 bytes, see ntpshmread.h in gpsd source):
+        int   mode          offset 0    (must be set to 1)
+        int   count         offset 4    (incremented each update)
+        int   clockTimeStampSec   offset 8
+        int   clockTimeStampUSec  offset 12
+        int   receiveTimeStampSec offset 16
+        int   receiveTimeStampUSec offset 20
+        int   leap          offset 24   (0 = normal)
+        int   precision     offset 28   (-1 = ~0.5 s)
+        int   nsamples      offset 32   (3 for chrony)
+        int   valid         offset 36   (1 when data is ready)
+        ... padding to 96 bytes
+    """
+
+    SHM_KEY = 0x4e545030   # NTP0 — matches chrony "refclock SHM 0"
+    SHM_SIZE = 96
+
+    def __init__(self, log_fn):
+        self.log = log_fn
+        self._shm = None
+        self._count = 0
+        self._attached = False
+
+    def attach(self):
+        """Attach to (or create) the NTP SHM 0 segment with world-readable perms."""
+        if self._attached:
+            return True
+        try:
+            import sysv_ipc
+            try:
+                self._shm = sysv_ipc.SharedMemory(self.SHM_KEY)
+            except sysv_ipc.ExistentialError:
+                self._shm = sysv_ipc.SharedMemory(
+                    self.SHM_KEY, sysv_ipc.IPC_CREAT,
+                    mode=0o666, size=self.SHM_SIZE
+                )
+            self._attached = True
+            self.log("[SHM] Attached to NTP SHM 0")
+            return True
+        except ImportError:
+            # Fall back to ctypes if sysv_ipc not installed
+            return self._attach_ctypes()
+        except Exception as e:
+            self.log(f"[SHM] Failed to attach: {e}")
+            return False
+
+    def _attach_ctypes(self) -> bool:
+        """Attach using ctypes (no external deps)."""
+        try:
+            import ctypes
+            import ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            # shmget(key, size, flags)
+            IPC_CREAT = 0o1000
+            shmid = libc.shmget(self.SHM_KEY, self.SHM_SIZE, IPC_CREAT | 0o666)
+            if shmid < 0:
+                self.log(f"[SHM] shmget failed (errno {ctypes.get_errno()})")
+                return False
+            # shmat(shmid, NULL, 0)
+            libc.shmat.restype = ctypes.c_void_p
+            addr = libc.shmat(shmid, None, 0)
+            if addr == ctypes.c_void_p(-1).value:
+                self.log(f"[SHM] shmat failed (errno {ctypes.get_errno()})")
+                return False
+            self._shm = addr
+            self._attached = True
+            self._use_ctypes = True
+            self.log("[SHM] Attached to NTP SHM 0 (ctypes)")
+            return True
+        except Exception as e:
+            self.log(f"[SHM] ctypes attach failed: {e}")
+            return False
+
+    def write(self, clock_sec: int, clock_usec: int,
+              recv_sec: int, recv_usec: int):
+        """Write a GPS time sample to SHM for chrony to read."""
+        if not self._attached:
+            return
+        import struct
+        self._count += 1
+        # Set valid=0, write data, then set valid=1 (lock-free protocol)
+        if hasattr(self, '_use_ctypes') and self._use_ctypes:
+            import ctypes
+            buf = (ctypes.c_byte * self.SHM_SIZE)()
+            struct.pack_into("iiiiiiiiii", buf, 0,
+                             1,               # mode
+                             self._count,      # count
+                             clock_sec,        # clockTimeStampSec
+                             clock_usec,       # clockTimeStampUSec
+                             recv_sec,         # receiveTimeStampSec
+                             recv_usec,        # receiveTimeStampUSec
+                             0,               # leap (normal)
+                             -1,              # precision (~0.5 s)
+                             3,               # nsamples
+                             0)               # valid = 0 (writing)
+            ctypes.memmove(self._shm, buf, self.SHM_SIZE)
+            # Now set valid=1
+            struct.pack_into("i", buf, 36, 1)
+            ctypes.memmove(self._shm + 36, ctypes.addressof(buf) + 36, 4)
+        else:
+            # sysv_ipc path
+            data = struct.pack("iiiiiiiiii",
+                               1, self._count,
+                               clock_sec, clock_usec,
+                               recv_sec, recv_usec,
+                               0, -1, 3, 0)   # valid=0
+            data = data.ljust(self.SHM_SIZE, b'\x00')
+            self._shm.write(data, 0)
+            # Set valid=1
+            self._shm.write(struct.pack("i", 1), 36)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  GPS READER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1251,6 +1375,7 @@ class GPSReader:
         self.last_update = 0.0
         self.state = "idle"
         self._serial = None
+        self._shm = NtpShmWriter(log_fn)
 
     def _nmea_checksum_valid(self, sentence: str) -> bool:
         if "*" not in sentence:
@@ -1333,6 +1458,42 @@ class GPSReader:
         except (ValueError, IndexError):
             pass
 
+    def _write_shm(self):
+        """Write current GPS time to NTP SHM 0 for chrony.
+
+        Called after each valid GGA parse.  Constructs a UTC timestamp from
+        the parsed utc_time + utc_date fields and writes it alongside the
+        local receive time so chrony can compute offset.
+        """
+        if self.fix_type < 1 or not self.utc_time:
+            return
+        if not self._shm._attached:
+            self._shm.attach()
+        if not self._shm._attached:
+            return
+        try:
+            # Build GPS clock time from parsed NMEA fields
+            h, m, s = int(self.utc_time[:2]), int(self.utc_time[3:5]), int(self.utc_time[6:8])
+            if self.utc_date:
+                # utc_date format: "2026-03-29"
+                from datetime import datetime, timezone
+                dt = datetime(int(self.utc_date[:4]), int(self.utc_date[5:7]),
+                              int(self.utc_date[8:10]), h, m, s, tzinfo=timezone.utc)
+            else:
+                # No date yet — use today's date
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
+            clock_sec = int(dt.timestamp())
+            clock_usec = 0
+            # Receive time = local monotonic wall clock
+            now_ts = time.time()
+            recv_sec = int(now_ts)
+            recv_usec = int((now_ts - recv_sec) * 1_000_000)
+            self._shm.write(clock_sec, clock_usec, recv_sec, recv_usec)
+        except Exception:
+            pass
+
     def _check_pps(self):
         pps_path = "/sys/class/pps/pps0/assert"
         try:
@@ -1386,6 +1547,7 @@ class GPSReader:
                         tag = fields[0]
                         if tag in ("$GPGGA", "$GNGGA"):
                             self._parse_gga(fields)
+                            self._write_shm()
                         elif tag in ("$GPRMC", "$GNRMC"):
                             self._parse_rmc(fields)
                         elif tag in ("$GPGSV", "$GNGSV", "$GLGSV"):
