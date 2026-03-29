@@ -1269,13 +1269,18 @@ class NtpShmWriter:
             return True
         try:
             import sysv_ipc
+            # Remove any stale segment with wrong perms (e.g. 600 from old GPSD)
             try:
-                self._shm = sysv_ipc.SharedMemory(self.SHM_KEY)
+                old = sysv_ipc.SharedMemory(self.SHM_KEY)
+                old.remove()
+                self.log("[SHM] Removed stale SHM segment (wrong perms)")
             except sysv_ipc.ExistentialError:
-                self._shm = sysv_ipc.SharedMemory(
-                    self.SHM_KEY, sysv_ipc.IPC_CREAT,
-                    mode=0o666, size=self.SHM_SIZE
-                )
+                pass
+            # Create fresh with world-readable perms so chrony (_chrony user) can read
+            self._shm = sysv_ipc.SharedMemory(
+                self.SHM_KEY, sysv_ipc.IPC_CREAT | sysv_ipc.IPC_EXCL,
+                mode=0o666, size=self.SHM_SIZE
+            )
             self._attached = True
             self.log("[SHM] Attached to NTP SHM 0")
             return True
@@ -1292,9 +1297,21 @@ class NtpShmWriter:
             import ctypes
             import ctypes.util
             libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-            # shmget(key, size, flags)
+            # Try to get existing segment first
+            shmid = libc.shmget(self.SHM_KEY, self.SHM_SIZE, 0)
+            if shmid >= 0:
+                # Segment exists — delete it so we can recreate with correct perms.
+                # Old GPSD-created segments have 600 perms; chrony needs 666.
+                libc.shmctl(shmid, 0, None)  # IPC_RMID = 0
+                self.log("[SHM] Removed stale SHM segment (wrong perms)")
+            # Create fresh with world-readable perms
             IPC_CREAT = 0o1000
-            shmid = libc.shmget(self.SHM_KEY, self.SHM_SIZE, IPC_CREAT | 0o666)
+            IPC_EXCL  = 0o2000
+            shmid = libc.shmget(self.SHM_KEY, self.SHM_SIZE,
+                                IPC_CREAT | IPC_EXCL | 0o666)
+            if shmid < 0:
+                # Race: someone else created it; just open it
+                shmid = libc.shmget(self.SHM_KEY, self.SHM_SIZE, 0)
             if shmid < 0:
                 self.log(f"[SHM] shmget failed (errno {ctypes.get_errno()})")
                 return False
