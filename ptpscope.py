@@ -360,8 +360,11 @@ textarea{min-height:80px;font-family:monospace;font-size:13px;resize:vertical}
 <div class="pn on" id="p-ptp">
 <div class="sec">PTP Grandmaster</div>
 <label>Domain (0-127)<input type="number" name="ptp_domain" value="{{cfg.ptp.domain}}" min="0" max="127"></label>
-<label>Network Interface<input type="text" name="ptp_interface" value="{{cfg.ptp.interface}}"></label>
-<div class="help">e.g. eth0, end0, enp1s0</div>
+<label>Network Interface
+<select name="ptp_interface">
+{% for iface in net_ifaces %}<option value="{{iface}}" {{'selected' if cfg.ptp.interface==iface}}>{{iface}}</option>
+{% endfor %}
+</select></label>
 <label>Transport
 <select name="ptp_transport">
 <option value="UDPv4" {{'selected' if cfg.ptp.transport=='UDPv4'}}>UDPv4</option>
@@ -2176,6 +2179,21 @@ def topnav_safe(active=""):
     return Markup(topnav(active))
 
 
+def _detect_interfaces():
+    """Return list of non-loopback network interface names."""
+    ifaces = []
+    try:
+        net_dir = "/sys/class/net"
+        if os.path.isdir(net_dir):
+            for name in sorted(os.listdir(net_dir)):
+                if name == "lo":
+                    continue
+                ifaces.append(name)
+    except Exception:
+        pass
+    return ifaces if ifaces else ["eth0"]
+
+
 # ── Context processor ─────────────────────────────────────────────────────────
 @app.context_processor
 def _inject_globals():
@@ -2186,6 +2204,7 @@ def _inject_globals():
         "build": BUILD,
         "role": app_config.node.role,
         "cfg": app_config,
+        "net_ifaces": _detect_interfaces(),
     }
 
 
