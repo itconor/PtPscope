@@ -27,7 +27,7 @@ fi
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════╗"
-echo "  ║       PTPScope Installer v1.1.0          ║"
+echo "  ║       PTPScope Installer v1.2.0          ║"
 echo "  ║     GPS→NTP→PTP Grandmaster Suite        ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -255,15 +255,56 @@ fi
 "${INSTALL_ROOT}/venv/bin/pip" install $PIP_PKGS -q
 ok "Python packages installed (${PIP_PKGS})"
 
-# ── Copy application ──────────────────────────────────────────────────────────
+# ── Fetch latest ptpscope.py from GitHub (fall back to local copy) ────────────
 step "Installing PTPScope application"
-if [[ -f "${SCRIPT_DIR}/ptpscope.py" ]]; then
-    cp "${SCRIPT_DIR}/ptpscope.py" "${INSTALL_ROOT}/ptpscope.py"
-    chmod 644 "${INSTALL_ROOT}/ptpscope.py"
-    ok "ptpscope.py installed"
+GH_RAW_URL="https://raw.githubusercontent.com/itconor/PtPscope/main/ptpscope.py"
+FETCHED=false
+
+if command -v curl &>/dev/null; then
+    if curl -fsSL --connect-timeout 10 --max-time 60 -o /tmp/ptpscope_latest.py "$GH_RAW_URL" 2>/dev/null; then
+        # Sanity-check: must contain BUILD string
+        if grep -q "PTPScope-" /tmp/ptpscope_latest.py; then
+            GH_VER=$(grep -oP 'PTPScope-\K[0-9]+\.[0-9]+\.[0-9]+' /tmp/ptpscope_latest.py | head -1)
+            cp /tmp/ptpscope_latest.py "${INSTALL_ROOT}/ptpscope.py"
+            chmod 644 "${INSTALL_ROOT}/ptpscope.py"
+            ok "ptpscope.py ${GH_VER} downloaded from GitHub (latest)"
+            FETCHED=true
+        else
+            warn "Downloaded file doesn't look like PTPScope — using local copy"
+        fi
+        rm -f /tmp/ptpscope_latest.py
+    else
+        warn "Could not reach GitHub — using local copy"
+    fi
+elif command -v wget &>/dev/null; then
+    if wget -q --timeout=10 -O /tmp/ptpscope_latest.py "$GH_RAW_URL" 2>/dev/null; then
+        if grep -q "PTPScope-" /tmp/ptpscope_latest.py; then
+            GH_VER=$(grep -oP 'PTPScope-\K[0-9]+\.[0-9]+\.[0-9]+' /tmp/ptpscope_latest.py | head -1)
+            cp /tmp/ptpscope_latest.py "${INSTALL_ROOT}/ptpscope.py"
+            chmod 644 "${INSTALL_ROOT}/ptpscope.py"
+            ok "ptpscope.py ${GH_VER} downloaded from GitHub (latest)"
+            FETCHED=true
+        else
+            warn "Downloaded file doesn't look like PTPScope — using local copy"
+        fi
+        rm -f /tmp/ptpscope_latest.py
+    else
+        warn "Could not reach GitHub — using local copy"
+    fi
 else
-    err "ptpscope.py not found in ${SCRIPT_DIR}"
-    exit 1
+    info "Neither curl nor wget found — using local copy"
+fi
+
+if ! $FETCHED; then
+    if [[ -f "${SCRIPT_DIR}/ptpscope.py" ]]; then
+        cp "${SCRIPT_DIR}/ptpscope.py" "${INSTALL_ROOT}/ptpscope.py"
+        chmod 644 "${INSTALL_ROOT}/ptpscope.py"
+        LOCAL_VER=$(grep -oP 'PTPScope-\K[0-9]+\.[0-9]+\.[0-9]+' "${INSTALL_ROOT}/ptpscope.py" | head -1)
+        ok "ptpscope.py ${LOCAL_VER} installed from local copy"
+    else
+        err "ptpscope.py not found in ${SCRIPT_DIR} and GitHub download failed"
+        exit 1
+    fi
 fi
 
 if [[ -f "${SCRIPT_DIR}/static/ptpscope_icon.png" ]]; then
@@ -402,15 +443,15 @@ if [[ "$NODE_ROLE" == "gps_source" ]]; then
     echo -e "    1. On the PTP Master, install PTPScope with role 'PTP Master'"
     echo -e "    2. Use the same secret key on both machines"
     echo -e "    3. Set the GPS Source URL in the PTP Master web UI: http://${IP_ADDR}:5001"
-    echo -e "    4. On the PTP Master, edit chrony.conf to use this node as NTP server: ${IP_ADDR}"
+    echo -e "    4. On the PTP Master web UI → Settings → Chrony, enter GPS Source IP: ${IP_ADDR}"
     echo ""
 fi
 
 if [[ "$NODE_ROLE" == "ptp_master" ]]; then
     echo -e "  ${BOLD}Next steps:${NC}"
-    echo -e "    1. Edit /etc/chrony/chrony.conf — add: server <gps-pi-ip> iburst prefer"
-    echo -e "    2. sudo systemctl restart chrony"
-    echo -e "    3. In the PTPScope web UI → Configuration → Node, set the GPS Source secret key"
+    echo -e "    1. In the PTPScope web UI → Settings → Chrony, enter the GPS Source IP"
+    echo -e "       (this writes chrony.conf and restarts chrony automatically)"
+    echo -e "    2. In Settings → Node, set the GPS Source secret key"
     echo ""
     if [[ -n "${TS_MODE:-}" ]]; then
         echo -e "  ${BOLD}Timestamping:${NC}  ${TS_MODE}"
