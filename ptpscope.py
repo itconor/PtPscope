@@ -3,7 +3,7 @@
 # PTPScope — GPS PTP Grandmaster for Raspberry Pi
 # Single-file Flask application with embedded templates
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD = "PTPScope-1.3.0"
+BUILD = "PTPScope-1.3.1"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
@@ -1337,11 +1337,11 @@ class NtpShmWriter:
             return
         import struct
         self._count += 1
-        # NTP SHM protocol (mode 0):
+        # NTP SHM protocol (mode 1):
         #   1. Writer sets valid=0
         #   2. Writer updates clock/receive timestamps and increments count
         #   3. Writer sets valid=1
-        # Chrony reads: if valid==1, grab data, set valid=0 (consumer clears it)
+        # Chrony reads: if valid==1 and count changed, grab data, set valid=0
         if hasattr(self, '_use_ctypes') and self._use_ctypes:
             import ctypes
             # Step 1: set valid=0
@@ -1351,7 +1351,7 @@ class NtpShmWriter:
             # Step 2: write all fields
             buf = (ctypes.c_byte * self.SHM_SIZE)()
             struct.pack_into("iiiiiiiiii", buf, 0,
-                             0,               # mode (0 = simple protocol)
+                             1,               # mode (1 = simple valid-flag protocol)
                              self._count,      # count
                              clock_sec,        # clockTimeStampSec
                              clock_usec,       # clockTimeStampUSec
@@ -1372,7 +1372,7 @@ class NtpShmWriter:
             self._shm.write(struct.pack("i", 0), 36)
             # Step 2: write fields
             data = struct.pack("iiiiiiiii",
-                               0, self._count,
+                               1, self._count,
                                clock_sec, clock_usec,
                                recv_sec, recv_usec,
                                0, -1, 3)
