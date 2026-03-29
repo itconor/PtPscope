@@ -3,7 +3,7 @@
 # PTPScope — GPS PTP Grandmaster for Raspberry Pi
 # Single-file Flask application with embedded templates
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD = "PTPScope-1.1.0"
+BUILD = "PTPScope-1.2.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
@@ -349,6 +349,7 @@ textarea{min-height:80px;font-family:monospace;font-size:13px;resize:vertical}
   <button class="tb" id="b-network" onclick="st('network')">Network</button>
   <button class="tb" id="b-security" onclick="st('security')">Security</button>
   <button class="tb" id="b-node" onclick="st('node')">Node</button>
+  <button class="tb" id="b-update" onclick="st('update');setTimeout(checkForUpdates,200)">Update</button>
 </div>
 <div class="ct">
 {% with msgs = get_flashed_messages() %}{% if msgs %}<ul class="fl">{% for m in msgs %}<li>{{m}}</li>{% endfor %}</ul>{% endif %}{% endwith %}
@@ -471,6 +472,18 @@ textarea{min-height:80px;font-family:monospace;font-size:13px;resize:vertical}
 <div class="act"><button type="submit" class="btn bp">Save Node Settings</button></div>
 </div>
 </form>
+
+<!-- Update Panel (outside form — no submit needed) -->
+<div class="pn" id="p-update">
+<div class="sec">🔄 Software Update</div>
+<p class="help" style="margin-bottom:12px">PTPScope checks GitHub for updates every 6 hours. Use the button below to check right now.</p>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <button id="upd-check-btn" type="button" class="btn bp" style="font-size:13px">🔍 Check for Updates</button>
+  <span id="upd-status" style="font-size:12px;color:var(--mu)">Current: <strong style="color:var(--tx)">{{build}}</strong></span>
+</div>
+<div id="upd-result" style="margin-top:12px;font-size:13px;display:none"></div>
+</div>
+
 </div>
 </div>
 <script nonce="{{csp_nonce()}}">
@@ -504,6 +517,106 @@ document.getElementById('node-gen-secret-btn').addEventListener('click',function
   var key=Array.from(arr).map(function(b){return chars[b%chars.length];}).join('');
   document.getElementById('node-secret-input').value=key;
 });
+
+// ── Self-update UI ──────────────────────────────────────────────────────────
+function _csrf(){
+  return (document.querySelector('meta[name="csrf-token"]')||{}).content
+      || (document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/)||[])[1]
+      || '';
+}
+
+function checkForUpdates(){
+  var btn=document.getElementById('upd-check-btn');
+  var res=document.getElementById('upd-result');
+  if(!btn||!res) return;
+  btn.disabled=true; btn.textContent='Checking…';
+  res.style.display='none';
+  fetch('/api/version_check/refresh',{method:'POST',headers:{'X-CSRFToken':_csrf()}})
+    .then(function(r){return r.json();}).then(function(){
+      setTimeout(function(){
+        fetch('/api/version_check').then(function(r){return r.json();}).then(function(d){
+          btn.disabled=false; btn.textContent='🔍 Check for Updates';
+          res.style.display='';
+          if(d.error && !d.latest){
+            res.innerHTML='<span style="color:var(--wn)">⚠ Could not check: <code style="font-size:11px;color:#fde68a">'+d.error+'</code></span>';
+          } else if(d.update_available){
+            _showUpd(d.latest, d.current);
+          } else {
+            res.innerHTML='<span style="color:var(--ok)">✓ You are on the latest version ('+d.current+').</span>';
+          }
+        });
+      }, 4000);
+    }).catch(function(){
+      btn.disabled=false; btn.textContent='🔍 Check for Updates';
+      res.style.display=''; res.innerHTML='<span style="color:var(--al)">Request failed — check network.</span>';
+    });
+}
+
+function _showUpd(latest, current){
+  var res=document.getElementById('upd-result');
+  if(!res) return;
+  res.style.display='';
+  res.innerHTML=
+    '<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 14px;background:#1c3a10;border:1px solid #4ade80;border-radius:8px">'
+    +'<span style="color:#fde68a">⬆ <strong style="color:#fff">PTPScope '+latest+'</strong> is available'
+    +(current?' <span style="color:var(--mu);font-size:11px">(you are on '+current+')</span>':'')
+    +'</span>'
+    +'<button class="btn" style="background:#166534;color:#fff;font-size:12px" data-action="upd-confirm" data-ver="'+latest+'" data-current="'+(current||'')+'">⬆ Apply Update &amp; Restart</button>'
+    +'</div>';
+}
+
+function _confirmUpd(ver, current){
+  var res=document.getElementById('upd-result');
+  if(!res) return;
+  res.innerHTML=
+    '<div style="padding:10px 14px;background:#2a1505;border:1px solid #f97316;border-radius:8px">'
+    +'<p style="color:#fde68a;font-size:13px;margin:0 0 10px">⚠ Apply <strong style="color:#fff">PTPScope '+ver+'</strong> and restart?'
+    +' <span style="font-size:11px;color:var(--mu)">The page will reload automatically (~15 s).</span></p>'
+    +'<div style="display:flex;gap:10px;flex-wrap:wrap">'
+    +'<button class="btn" style="background:#166534;color:#fff;font-size:12px" data-action="upd-apply" data-ver="'+ver+'">✓ Apply Update</button>'
+    +'<button class="btn" style="background:#374151;color:#fff;font-size:12px" data-action="upd-cancel" data-ver="'+ver+'" data-current="'+(current||'')+'">✗ Cancel</button>'
+    +'</div></div>';
+}
+
+function _doUpd(ver){
+  var res=document.getElementById('upd-result');
+  if(!res) return;
+  res.innerHTML='<span style="color:var(--acc)">⏳ Downloading and applying update…</span>';
+  fetch('/api/update/apply',{method:'POST',headers:{'X-CSRFToken':_csrf()}})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        res.innerHTML='<span style="color:var(--ok)">✓ Updated ('+d.from_version+' → '+d.to_version+'). Restarting… <span id="upd-cd">--</span></span>';
+        var t0=Date.now();
+        function poll(){
+          var s=Math.round((Date.now()-t0)/1000);
+          var el=document.getElementById('upd-cd');
+          if(el) el.textContent=s+'s';
+          fetch('/',{method:'HEAD',cache:'no-store'})
+            .then(function(r){if(r.ok)location.reload(); else throw 0;})
+            .catch(function(){
+              if(Date.now()-t0<90000) setTimeout(poll,3000);
+              else if(el) el.parentElement.innerHTML='<span style="color:var(--wn)">⚠ No response after 90 s — try reloading.</span>';
+            });
+        }
+        setTimeout(poll,5000);
+      } else {
+        res.innerHTML='<span style="color:var(--al)">✗ '+(d.error||'Unknown error')+'</span>';
+      }
+    }).catch(function(e){
+      res.innerHTML='<span style="color:var(--al)">✗ '+e.message+'</span>';
+    });
+}
+
+document.addEventListener('click',function(e){
+  var btn=e.target.closest('#upd-result [data-action]');
+  if(!btn) return;
+  var a=btn.dataset.action, v=btn.dataset.ver, c=btn.dataset.current;
+  if(a==='upd-confirm') _confirmUpd(v,c);
+  else if(a==='upd-apply') _doUpd(v);
+  else if(a==='upd-cancel') _showUpd(v,c);
+});
+var _ub=document.getElementById('upd-check-btn');
+if(_ub) _ub.addEventListener('click',checkForUpdates);
 </script>
 </body></html>"""
 
@@ -801,6 +914,9 @@ GPS_PPS_GPIO         = 4
 GPS_POLL_INTERVAL    = 1.0
 
 PTP_CONF_PATH        = "/tmp/ptpscope_ptp4l.conf"
+
+_GH_RAW_VER_URL      = "https://raw.githubusercontent.com/itconor/PtPscope/main/ptpscope.py"
+_GH_API_RELEASES_URL = "https://api.github.com/repos/itconor/PtPscope/releases/latest"
 PTP_DEFAULT_DOMAIN   = 0
 PTP_DEFAULT_IFACE    = "eth0"
 PTP_DEFAULT_TRANSPORT = "UDPv4"
@@ -2384,6 +2500,239 @@ def _daily_prune_loop(stop_ev):
         log_fn("[Metrics] Daily prune completed")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SELF-UPDATE — check GitHub for new versions and apply from GUI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_UPDATE_STATE: dict = {"latest": None, "checked_at": 0.0, "error": None}
+
+def _ver_tuple(v: str):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except Exception:
+        return (0, 0, 0)
+
+def _fetch_latest_version() -> tuple:
+    """Return (version_str, error_str).  version_str is '' on failure."""
+    import re as _re
+    try:
+        import requests as _requests
+    except ImportError:
+        # Fall back to urllib
+        import urllib.request, json as _json
+        try:
+            req = urllib.request.Request(
+                _GH_API_RELEASES_URL,
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": f"PTPScope/{BUILD}"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read())
+            tag = data.get("tag_name", "")
+            m = _re.search(r"(\d+\.\d+\.\d+)", tag)
+            if m:
+                return m.group(1), ""
+        except Exception as e:
+            pass
+        # Fallback: raw file
+        for branch in ("main", "master"):
+            raw_url = f"https://raw.githubusercontent.com/itconor/PtPscope/{branch}/ptpscope.py"
+            try:
+                req = urllib.request.Request(raw_url, headers={"User-Agent": f"PTPScope/{BUILD}"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    buf = resp.read(262144)
+                m = _re.search(rb"PTPScope-(\d+\.\d+\.\d+)", buf)
+                if m:
+                    return m.group(1).decode(), ""
+            except Exception:
+                pass
+        return "", "Could not reach GitHub (no requests library; urllib fallback also failed)"
+
+    errors = []
+    # Try releases API
+    try:
+        resp = _requests.get(
+            _GH_API_RELEASES_URL, timeout=15,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": f"PTPScope/{BUILD}"},
+        )
+        if resp.status_code == 200:
+            tag = resp.json().get("tag_name", "")
+            m = _re.search(r"(\d+\.\d+\.\d+)", tag)
+            if m:
+                return m.group(1), ""
+        elif resp.status_code == 404:
+            errors.append("GitHub: no releases published yet")
+        else:
+            errors.append(f"GitHub releases API HTTP {resp.status_code}")
+    except Exception as e:
+        errors.append(f"GitHub releases API: {e}")
+
+    # Fallback: raw file
+    for branch in ("main", "master"):
+        raw_url = f"https://raw.githubusercontent.com/itconor/PtPscope/{branch}/ptpscope.py"
+        try:
+            resp = _requests.get(raw_url, timeout=30, stream=True)
+            if resp.status_code != 200:
+                errors.append(f"raw {branch}: HTTP {resp.status_code}")
+                resp.close()
+                continue
+            buf = b""
+            for part in resp.iter_content(8192):
+                buf += part
+                m = _re.search(rb"PTPScope-(\d+\.\d+\.\d+)", buf)
+                if m:
+                    resp.close()
+                    return m.group(1).decode(), ""
+                if len(buf) >= 262144:
+                    break
+            resp.close()
+            errors.append(f"raw {branch}: no version string found")
+        except Exception as e:
+            errors.append(f"raw {branch}: {e}")
+
+    return "", " | ".join(errors)
+
+
+def _version_check_loop(stop_ev: threading.Event):
+    time.sleep(30)
+    while not stop_ev.is_set():
+        try:
+            ver, err = _fetch_latest_version()
+            if ver:
+                _UPDATE_STATE["latest"] = ver
+                _UPDATE_STATE["error"] = None
+            else:
+                _UPDATE_STATE["error"] = err or "Could not reach GitHub"
+            _UPDATE_STATE["checked_at"] = time.time()
+        except Exception as _e:
+            _UPDATE_STATE["error"] = f"Version check crashed: {_e}"
+        stop_ev.wait(6 * 3600)
+
+
+@app.get("/api/version_check")
+@login_required
+def api_version_check():
+    current = BUILD.split("-")[-1]
+    latest = _UPDATE_STATE.get("latest")
+    update = bool(latest and _ver_tuple(latest) > _ver_tuple(current))
+    return jsonify({"current": current, "latest": latest,
+                    "update_available": update,
+                    "checked_at": _UPDATE_STATE.get("checked_at"),
+                    "error": _UPDATE_STATE.get("error")})
+
+
+@app.post("/api/version_check/refresh")
+@login_required
+@csrf_protect
+def api_version_check_refresh():
+    """Manually trigger an immediate version check."""
+    def _run():
+        ver, err = _fetch_latest_version()
+        if ver:
+            _UPDATE_STATE["latest"] = ver
+            _UPDATE_STATE["error"] = None
+        else:
+            _UPDATE_STATE["error"] = err or "Could not reach GitHub"
+        _UPDATE_STATE["checked_at"] = time.time()
+    threading.Thread(target=_run, daemon=True, name="VersionCheckOnDemand").start()
+    return jsonify({"ok": True, "note": "version check running in background"})
+
+
+@app.post("/api/update/apply")
+@login_required
+@csrf_protect
+def api_update_apply():
+    """Download latest ptpscope.py from GitHub, validate, replace, and restart."""
+    import shutil as _shutil, py_compile as _pyc, re as _re
+
+    current_ver = BUILD.split("-")[-1]
+    latest_ver = _UPDATE_STATE.get("latest")
+    if not latest_ver:
+        return jsonify({"error": "No update info available — run a version check first"}), 400
+    if _ver_tuple(latest_ver) <= _ver_tuple(current_ver):
+        return jsonify({"error": f"Already on latest version ({current_ver})"}), 400
+
+    # Download
+    try:
+        try:
+            import requests as _requests
+            resp = _requests.get(_GH_RAW_VER_URL, timeout=60)
+            resp.raise_for_status()
+            new_bytes = resp.content
+        except ImportError:
+            import urllib.request
+            req = urllib.request.Request(_GH_RAW_VER_URL,
+                                        headers={"User-Agent": f"PTPScope/{BUILD}"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                new_bytes = resp.read()
+    except Exception as e:
+        return jsonify({"error": f"Download failed: {e}"}), 502
+
+    # Sanity-check downloaded file
+    text = new_bytes.decode("utf-8", errors="ignore")
+    m = _re.search(r"PTPScope-(\d+\.\d+\.\d+)", text)
+    if not m:
+        return jsonify({"error": "Downloaded file does not look like a valid PTPScope release"}), 502
+    dl_ver = m.group(1)
+    if _ver_tuple(dl_ver) <= _ver_tuple(current_ver):
+        return jsonify({"error": f"Downloaded version ({dl_ver}) is not newer than running ({current_ver})"}), 400
+
+    this_file = os.path.abspath(__file__)
+    tmp_path = this_file + ".update_tmp"
+    bak_path = this_file + f".bak_{current_ver}"
+
+    # Write temp file and syntax check
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(new_bytes)
+        _pyc.compile(tmp_path, doraise=True)
+    except Exception as e:
+        try: os.remove(tmp_path)
+        except OSError: pass
+        return jsonify({"error": f"Downloaded file failed syntax check: {e}"}), 502
+
+    # Backup current file
+    try:
+        _shutil.copy2(this_file, bak_path)
+    except Exception as e:
+        try: os.remove(tmp_path)
+        except OSError: pass
+        return jsonify({"error": f"Could not create backup at {bak_path}: {e}"}), 500
+
+    # Atomic replace
+    try:
+        os.replace(tmp_path, this_file)
+    except Exception as e:
+        try: _shutil.copy2(bak_path, this_file)
+        except OSError: pass
+        try: os.remove(tmp_path)
+        except OSError: pass
+        return jsonify({"error": f"Could not replace application file: {e}"}), 500
+
+    log_fn(f"[Update] ptpscope.py replaced: {current_ver} → {dl_ver}. Restarting in 3 s…")
+
+    # Restart via os.execv (no systemd dependency)
+    def _restart():
+        time.sleep(3)
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception:
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+            except Exception:
+                sys.exit(0)
+    threading.Thread(target=_restart, daemon=True, name="UpdateRestart").start()
+
+    return jsonify({
+        "ok": True,
+        "from_version": current_ver,
+        "to_version": dl_ver,
+        "backup": bak_path,
+        "note": "Update applied — restarting in 3 s. Page will reload automatically.",
+    })
+
+
 if __name__ == "__main__":
     print(f"[{BUILD}] Starting PTPScope...")
     print(f"[{BUILD}] Base directory: {BASE_DIR}")
@@ -2414,6 +2763,7 @@ if __name__ == "__main__":
     _start_thread("sys-stats", sys_stats.run)
     _start_thread("metrics-flush", _metrics_flush_loop)
     _start_thread("daily-prune", _daily_prune_loop)
+    _start_thread("version-check", _version_check_loop)
 
     log_fn(f"[{BUILD}] All background threads started")
 
