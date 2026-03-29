@@ -3,7 +3,7 @@
 # PTPScope — GPS PTP Grandmaster for Raspberry Pi
 # Single-file Flask application with embedded templates
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD = "PTPScope-1.3.4"
+BUILD = "PTPScope-1.3.5"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
@@ -1022,9 +1022,11 @@ def load_config() -> AppConfig:
                 auto_start=bool(p.get("auto_start", True)),
             )
             c = d.get("chrony", {})
+            # GPS/PPS refclocks only make sense on nodes with GPS hardware
+            _has_gps = cfg.node.role in ("gps_source", "standalone")
             cfg.chrony = ChronyConfig(
-                gps_refclock=bool(c.get("gps_refclock", True)),
-                pps_refclock=bool(c.get("pps_refclock", True)),
+                gps_refclock=bool(c.get("gps_refclock", _has_gps)),
+                pps_refclock=bool(c.get("pps_refclock", _has_gps)),
                 ntp_servers=c.get("ntp_servers", ""),
                 gps_server_ip=c.get("gps_server_ip", ""),
                 makestep=bool(c.get("makestep", True)),
@@ -1909,8 +1911,8 @@ def _apply_chrony_config(chrony_cfg: ChronyConfig, log_fn=None):
     if chrony_cfg.gps_refclock:
         lines.append("refclock SHM 0 refid GPS precision 1e-1 offset 0.5 delay 0.2")
 
-    # PPS refclock
-    if chrony_cfg.pps_refclock:
+    # PPS refclock — only if /dev/pps0 exists (crashes chrony otherwise)
+    if chrony_cfg.pps_refclock and os.path.exists("/dev/pps0"):
         lines.append("refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS prefer")
 
     # GPS Source server (PTP Master pointing at a GPS Pi)
