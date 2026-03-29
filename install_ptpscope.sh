@@ -302,7 +302,10 @@ if [[ "$NODE_ROLE" == "ptp_master" || "$NODE_ROLE" == "standalone" ]]; then
     if [[ -z "$DEFAULT_IFACE" ]]; then
         DEFAULT_IFACE="eth0"
     fi
-    if ethtool -T "$DEFAULT_IFACE" 2>/dev/null | grep -q "hardware-transmit"; then
+    # Intel/Broadcom NICs report "hardware-transmit"; Mellanox ConnectX cards
+    # report "SOF_TIMESTAMPING_TX_HARDWARE" — check both patterns.
+    ETHTOOL_OUT=$(ethtool -T "$DEFAULT_IFACE" 2>/dev/null || true)
+    if echo "$ETHTOOL_OUT" | grep -qE "hardware-transmit|SOF_TIMESTAMPING_TX_HARDWARE"; then
         ok "${DEFAULT_IFACE} supports hardware timestamping"
         TS_MODE="hardware"
     else

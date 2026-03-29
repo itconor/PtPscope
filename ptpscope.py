@@ -1348,7 +1348,12 @@ class PTPManager:
                 ["ethtool", "-T", interface],
                 capture_output=True, text=True, timeout=5
             )
-            if "hardware-transmit" in result.stdout and "hardware-receive" in result.stdout:
+            out = result.stdout
+            # Intel/Broadcom NICs report "hardware-transmit" / "hardware-receive"
+            # Mellanox ConnectX cards report SOF_TIMESTAMPING_TX_HARDWARE / RX_HARDWARE
+            has_tx = "hardware-transmit" in out or "SOF_TIMESTAMPING_TX_HARDWARE" in out
+            has_rx = "hardware-receive" in out or "SOF_TIMESTAMPING_RX_HARDWARE" in out
+            if has_tx and has_rx:
                 return "hardware"
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
