@@ -1337,12 +1337,21 @@ class NtpShmWriter:
             return
         import struct
         self._count += 1
-        # Set valid=0, write data, then set valid=1 (lock-free protocol)
+        # NTP SHM protocol (mode 0):
+        #   1. Writer sets valid=0
+        #   2. Writer updates clock/receive timestamps and increments count
+        #   3. Writer sets valid=1
+        # Chrony reads: if valid==1, grab data, set valid=0 (consumer clears it)
         if hasattr(self, '_use_ctypes') and self._use_ctypes:
             import ctypes
+            # Step 1: set valid=0
+            _zero = struct.pack("i", 0)
+            _zbuf = (ctypes.c_byte * 4)(*_zero)
+            ctypes.memmove(self._shm + 36, _zbuf, 4)
+            # Step 2: write all fields
             buf = (ctypes.c_byte * self.SHM_SIZE)()
             struct.pack_into("iiiiiiiiii", buf, 0,
-                             1,               # mode
+                             0,               # mode (0 = simple protocol)
                              self._count,      # count
                              clock_sec,        # clockTimeStampSec
                              clock_usec,       # clockTimeStampUSec
@@ -1351,21 +1360,24 @@ class NtpShmWriter:
                              0,               # leap (normal)
                              -1,              # precision (~0.5 s)
                              3,               # nsamples
-                             0)               # valid = 0 (writing)
-            ctypes.memmove(self._shm, buf, self.SHM_SIZE)
-            # Now set valid=1
-            struct.pack_into("i", buf, 36, 1)
-            ctypes.memmove(self._shm + 36, ctypes.addressof(buf) + 36, 4)
+                             0)               # valid (will set to 1 below)
+            ctypes.memmove(self._shm, buf, 36)  # write up to valid
+            # Step 3: set valid=1
+            _one = struct.pack("i", 1)
+            _obuf = (ctypes.c_byte * 4)(*_one)
+            ctypes.memmove(self._shm + 36, _obuf, 4)
         else:
             # sysv_ipc path
-            data = struct.pack("iiiiiiiiii",
-                               1, self._count,
+            # Step 1: clear valid
+            self._shm.write(struct.pack("i", 0), 36)
+            # Step 2: write fields
+            data = struct.pack("iiiiiiiii",
+                               0, self._count,
                                clock_sec, clock_usec,
                                recv_sec, recv_usec,
-                               0, -1, 3, 0)   # valid=0
-            data = data.ljust(self.SHM_SIZE, b'\x00')
+                               0, -1, 3)
             self._shm.write(data, 0)
-            # Set valid=1
+            # Step 3: set valid=1
             self._shm.write(struct.pack("i", 1), 36)
 
 
