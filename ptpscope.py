@@ -419,11 +419,15 @@ textarea{min-height:80px;font-family:monospace;font-size:13px;resize:vertical}
 <div class="sec">Chrony / NTP</div>
 <div class="cr"><input type="checkbox" name="chrony_gps_refclock" {{'checked' if cfg.chrony.gps_refclock}}><label style="margin:0">GPS SHM refclock (via GPSD)</label></div>
 <div class="cr"><input type="checkbox" name="chrony_pps_refclock" {{'checked' if cfg.chrony.pps_refclock}}><label style="margin:0">PPS refclock (/dev/pps0)</label></div>
+<label>GPS Source IP<input type="text" name="chrony_gps_server_ip" value="{{cfg.chrony.gps_server_ip}}" placeholder="e.g. 192.168.1.50"></label>
+<div class="help">PTP Master: enter the GPS Source Pi's IP to use as preferred NTP server</div>
 <label>NTP Servers (one per line)<textarea name="chrony_ntp_servers">{{cfg.chrony.ntp_servers}}</textarea></label>
+<div class="cr"><input type="checkbox" name="chrony_makestep" {{'checked' if cfg.chrony.makestep}}><label style="margin:0">Allow large initial time step (makestep 1 3)</label></div>
 <div class="cr"><input type="checkbox" name="chrony_allow_clients" {{'checked' if cfg.chrony.allow_clients}}><label style="margin:0">Allow NTP clients</label></div>
 <label>Allowed Subnet<input type="text" name="chrony_allow_subnet" value="{{cfg.chrony.allow_subnet}}"></label>
 <div class="help">e.g. 192.168.1.0/24</div>
-<div class="act"><button type="submit" class="btn bp">Save Chrony Settings</button></div>
+<div class="act"><button type="submit" class="btn bp">Save &amp; Apply Chrony Settings</button></div>
+<div class="help">Saves to PTPScope config and writes /etc/chrony/chrony.conf, then restarts chrony.</div>
 </div>
 <!-- Network Panel -->
 <div class="pn" id="p-network">
@@ -842,6 +846,8 @@ class ChronyConfig:
     gps_refclock: bool = True
     pps_refclock: bool = True
     ntp_servers: str = ""
+    gps_server_ip: str = ""          # PTP Master: GPS Source IP for "server <ip> iburst prefer"
+    makestep: bool = True             # makestep 1 3 — allow large initial correction
     allow_clients: bool = False
     allow_subnet: str = "192.168.1.0/24"
 
@@ -901,6 +907,8 @@ def load_config() -> AppConfig:
                 gps_refclock=bool(c.get("gps_refclock", True)),
                 pps_refclock=bool(c.get("pps_refclock", True)),
                 ntp_servers=c.get("ntp_servers", ""),
+                gps_server_ip=c.get("gps_server_ip", ""),
+                makestep=bool(c.get("makestep", True)),
                 allow_clients=bool(c.get("allow_clients", False)),
                 allow_subnet=c.get("allow_subnet", "192.168.1.0/24"),
             )
@@ -1518,6 +1526,133 @@ pi_integral_const     0.3
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  CHRONY CONFIG WRITER — applies GUI settings to /etc/chrony/chrony.conf
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CHRONY_CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
+_CHRONY_MARKER = "# ── PTPScope managed block"
+
+def _find_chrony_conf():
+    """Return the path to chrony.conf, or None if not found."""
+    for p in _CHRONY_CONF_PATHS:
+        if os.path.isfile(p):
+            return p
+    return None
+
+def _apply_chrony_config(chrony_cfg: ChronyConfig, log_fn=None):
+    """Generate /etc/chrony/chrony.conf from GUI settings and restart chrony.
+
+    Preserves any lines OUTSIDE the managed block.  The managed block is
+    delimited by ``_CHRONY_MARKER`` start/end comments so repeated saves
+    don't duplicate entries.  Returns (ok: bool, message: str).
+    """
+    conf_path = _find_chrony_conf()
+    if not conf_path:
+        return False, "chrony.conf not found — is chrony installed?"
+
+    # ── Read existing file, strip any previous managed block ──────────────
+    try:
+        with open(conf_path, "r") as f:
+            existing = f.read()
+    except PermissionError:
+        return False, f"Permission denied reading {conf_path} — run PTPScope as root or with sudo"
+    except Exception as e:
+        return False, f"Failed to read {conf_path}: {e}"
+
+    # Remove previous managed block (between start/end markers)
+    import re as _re
+    managed_re = _re.compile(
+        r'\n?' + _re.escape(_CHRONY_MARKER) + r' START.*?'
+        + _re.escape(_CHRONY_MARKER) + r' END[^\n]*\n?',
+        _re.DOTALL
+    )
+    base = managed_re.sub('', existing).rstrip('\n')
+
+    # ── Build the managed block ──────────────────────────────────────────
+    lines = [f"{_CHRONY_MARKER} START — do not edit, managed by PTPScope GUI"]
+
+    # GPS SHM refclock
+    if chrony_cfg.gps_refclock:
+        lines.append("refclock SHM 0 refid GPS precision 1e-1 offset 0.0 delay 0.2 noselect")
+
+    # PPS refclock
+    if chrony_cfg.pps_refclock:
+        lines.append("refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS")
+
+    # GPS Source server (PTP Master pointing at a GPS Pi)
+    if chrony_cfg.gps_server_ip and chrony_cfg.gps_server_ip.strip():
+        lines.append(f"server {chrony_cfg.gps_server_ip.strip()} iburst prefer")
+
+    # NTP servers (one per line from textarea)
+    for srv in chrony_cfg.ntp_servers.strip().splitlines():
+        srv = srv.strip()
+        if srv and not srv.startswith("#"):
+            # Add "server" prefix if user just typed an IP/hostname
+            if not srv.startswith(("server ", "pool ", "peer ")):
+                srv = f"server {srv} iburst"
+            lines.append(srv)
+
+    # makestep — allow large initial time correction
+    if chrony_cfg.makestep:
+        lines.append("makestep 1 3")
+
+    # Allow NTP clients
+    if chrony_cfg.allow_clients and chrony_cfg.allow_subnet.strip():
+        lines.append(f"allow {chrony_cfg.allow_subnet.strip()}")
+
+    lines.append(f"{_CHRONY_MARKER} END")
+    block = "\n".join(lines)
+
+    # ── Write config ─────────────────────────────────────────────────────
+    new_conf = base + "\n\n" + block + "\n"
+    try:
+        # Backup before writing
+        import shutil
+        bak = conf_path + ".ptpscope-bak"
+        shutil.copy2(conf_path, bak)
+        with open(conf_path, "w") as f:
+            f.write(new_conf)
+    except PermissionError:
+        return False, f"Permission denied writing {conf_path} — run PTPScope as root or with sudo"
+    except Exception as e:
+        return False, f"Failed to write {conf_path}: {e}"
+
+    if log_fn:
+        log_fn(f"[Chrony] Config written to {conf_path}")
+
+    # ── Restart chrony ───────────────────────────────────────────────────
+    try:
+        r = subprocess.run(
+            ["systemctl", "restart", "chrony"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            if log_fn:
+                log_fn("[Chrony] Service restarted successfully")
+            return True, f"Chrony config applied to {conf_path} and service restarted."
+        else:
+            # Try chronyd directly (some systems)
+            r2 = subprocess.run(
+                ["systemctl", "restart", "chronyd"],
+                capture_output=True, text=True, timeout=10
+            )
+            if r2.returncode == 0:
+                if log_fn:
+                    log_fn("[Chrony] Service (chronyd) restarted successfully")
+                return True, f"Chrony config applied to {conf_path} and service restarted."
+            msg = r.stderr.strip() or "unknown error"
+            if log_fn:
+                log_fn(f"[Chrony] Failed to restart: {msg}")
+            return True, f"Config written to {conf_path} but restart failed: {msg}. Try: sudo systemctl restart chrony"
+    except FileNotFoundError:
+        if log_fn:
+            log_fn("[Chrony] systemctl not found — config written but not restarted")
+        return True, f"Config written to {conf_path}. Restart chrony manually (systemctl not found)."
+    except Exception as e:
+        return True, f"Config written to {conf_path} but restart failed: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  CHRONY MONITOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1999,6 +2134,8 @@ def config_save():
         app_config.chrony.gps_refclock = "chrony_gps_refclock" in request.form
         app_config.chrony.pps_refclock = "chrony_pps_refclock" in request.form
         app_config.chrony.ntp_servers = request.form.get("chrony_ntp_servers", "")
+        app_config.chrony.gps_server_ip = request.form.get("chrony_gps_server_ip", "").strip()
+        app_config.chrony.makestep = "chrony_makestep" in request.form
         app_config.chrony.allow_clients = "chrony_allow_clients" in request.form
         app_config.chrony.allow_subnet = request.form.get("chrony_allow_subnet", "192.168.1.0/24").strip()
     elif panel == "network":
@@ -2018,8 +2155,18 @@ def config_save():
         app_config.node.secret_key = request.form.get("node_secret_key", "").strip()
         app_config.node.hub_url    = request.form.get("node_hub_url", "").strip()
     save_config(app_config)
-    flash(f"{panel.upper()} settings saved.")
     log_fn(f"[Config] {panel} settings updated")
+
+    # ── Apply chrony config to system when saving chrony panel ────────────
+    if panel == "chrony":
+        ok, msg = _apply_chrony_config(app_config.chrony, log_fn)
+        if ok:
+            flash(f"Chrony settings saved. {msg}")
+        else:
+            flash(f"Chrony settings saved but could not apply: {msg}")
+    else:
+        flash(f"{panel.upper()} settings saved.")
+
     return redirect(url_for("config_page") + f"#{panel}")
 
 
