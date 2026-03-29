@@ -3,7 +3,7 @@
 # PTPScope — GPS PTP Grandmaster for Raspberry Pi
 # Single-file Flask application with embedded templates
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD = "PTPScope-1.3.3"
+BUILD = "PTPScope-1.3.4"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
@@ -1883,36 +1883,27 @@ def _find_chrony_conf():
     return None
 
 def _apply_chrony_config(chrony_cfg: ChronyConfig, log_fn=None):
-    """Generate /etc/chrony/chrony.conf from GUI settings and restart chrony.
+    """Write PTPScope chrony settings and restart chrony.
 
-    Preserves any lines OUTSIDE the managed block.  The managed block is
-    delimited by ``_CHRONY_MARKER`` start/end comments so repeated saves
-    don't duplicate entries.  Returns (ok: bool, message: str).
+    On systems with a ``conf.d`` directory (Debian/Ubuntu), writes to
+    ``/etc/chrony/conf.d/ptpscope.conf`` — this avoids the problem where
+    directives appended to chrony.conf after the ``confdir`` line are
+    silently ignored by chrony.
+
+    On systems without ``conf.d``, falls back to appending a managed block
+    to chrony.conf (delimited by ``_CHRONY_MARKER``).
+
+    Also cleans up any old managed block from chrony.conf when migrating
+    to the conf.d approach.
+
+    Returns (ok: bool, message: str).
     """
     conf_path = _find_chrony_conf()
     if not conf_path:
         return False, "chrony.conf not found — is chrony installed?"
 
-    # ── Read existing file, strip any previous managed block ──────────────
-    try:
-        with open(conf_path, "r") as f:
-            existing = f.read()
-    except PermissionError:
-        return False, f"Permission denied reading {conf_path} — run PTPScope as root or with sudo"
-    except Exception as e:
-        return False, f"Failed to read {conf_path}: {e}"
-
-    # Remove previous managed block (between start/end markers)
-    import re as _re
-    managed_re = _re.compile(
-        r'\n?' + _re.escape(_CHRONY_MARKER) + r' START.*?'
-        + _re.escape(_CHRONY_MARKER) + r' END[^\n]*\n?',
-        _re.DOTALL
-    )
-    base = managed_re.sub('', existing).rstrip('\n')
-
-    # ── Build the managed block ──────────────────────────────────────────
-    lines = [f"{_CHRONY_MARKER} START — do not edit, managed by PTPScope GUI"]
+    # ── Build the configuration lines ────────────────────────────────────
+    lines = []
 
     # GPS SHM refclock
     if chrony_cfg.gps_refclock:
@@ -1930,7 +1921,6 @@ def _apply_chrony_config(chrony_cfg: ChronyConfig, log_fn=None):
     for srv in chrony_cfg.ntp_servers.strip().splitlines():
         srv = srv.strip()
         if srv and not srv.startswith("#"):
-            # Add "server" prefix if user just typed an IP/hostname
             if not srv.startswith(("server ", "pool ", "peer ")):
                 srv = f"server {srv} iburst"
             lines.append(srv)
@@ -1943,25 +1933,82 @@ def _apply_chrony_config(chrony_cfg: ChronyConfig, log_fn=None):
     if chrony_cfg.allow_clients and chrony_cfg.allow_subnet.strip():
         lines.append(f"allow {chrony_cfg.allow_subnet.strip()}")
 
-    lines.append(f"{_CHRONY_MARKER} END")
-    block = "\n".join(lines)
+    # ── Determine write target ───────────────────────────────────────────
+    # Prefer conf.d if it exists (avoids confdir ordering issue)
+    conf_dir = os.path.dirname(conf_path)
+    confd_path = os.path.join(conf_dir, "conf.d")
+    use_confd = os.path.isdir(confd_path)
 
-    # ── Write config ─────────────────────────────────────────────────────
-    new_conf = base + "\n\n" + block + "\n"
-    try:
-        # Backup before writing
-        import shutil
-        bak = conf_path + ".ptpscope-bak"
-        shutil.copy2(conf_path, bak)
-        with open(conf_path, "w") as f:
-            f.write(new_conf)
-    except PermissionError:
-        return False, f"Permission denied writing {conf_path} — run PTPScope as root or with sudo"
-    except Exception as e:
-        return False, f"Failed to write {conf_path}: {e}"
+    if use_confd:
+        target_path = os.path.join(confd_path, "ptpscope.conf")
+        content = f"{_CHRONY_MARKER} START — managed by PTPScope GUI\n"
+        content += "\n".join(lines) + "\n"
+        content += f"{_CHRONY_MARKER} END\n"
 
-    if log_fn:
-        log_fn(f"[Chrony] Config written to {conf_path}")
+        try:
+            with open(target_path, "w") as f:
+                f.write(content)
+        except PermissionError:
+            return False, f"Permission denied writing {target_path}"
+        except Exception as e:
+            return False, f"Failed to write {target_path}: {e}"
+
+        # Clean up any old managed block from chrony.conf itself
+        try:
+            import re as _re
+            with open(conf_path, "r") as f:
+                existing = f.read()
+            managed_re = _re.compile(
+                r'\n?' + _re.escape(_CHRONY_MARKER) + r' START.*?'
+                + _re.escape(_CHRONY_MARKER) + r' END[^\n]*\n?',
+                _re.DOTALL
+            )
+            if managed_re.search(existing):
+                cleaned = managed_re.sub('', existing).rstrip('\n') + '\n'
+                with open(conf_path, "w") as f:
+                    f.write(cleaned)
+                if log_fn:
+                    log_fn(f"[Chrony] Removed old managed block from {conf_path}")
+        except Exception:
+            pass  # non-fatal — the conf.d file is what matters
+
+        if log_fn:
+            log_fn(f"[Chrony] Config written to {target_path}")
+    else:
+        # Fallback: append managed block to chrony.conf
+        try:
+            with open(conf_path, "r") as f:
+                existing = f.read()
+        except PermissionError:
+            return False, f"Permission denied reading {conf_path}"
+        except Exception as e:
+            return False, f"Failed to read {conf_path}: {e}"
+
+        import re as _re
+        managed_re = _re.compile(
+            r'\n?' + _re.escape(_CHRONY_MARKER) + r' START.*?'
+            + _re.escape(_CHRONY_MARKER) + r' END[^\n]*\n?',
+            _re.DOTALL
+        )
+        base = managed_re.sub('', existing).rstrip('\n')
+        block_lines = [f"{_CHRONY_MARKER} START — managed by PTPScope GUI"]
+        block_lines.extend(lines)
+        block_lines.append(f"{_CHRONY_MARKER} END")
+        block = "\n".join(block_lines)
+        new_conf = base + "\n\n" + block + "\n"
+
+        try:
+            import shutil
+            shutil.copy2(conf_path, conf_path + ".ptpscope-bak")
+            with open(conf_path, "w") as f:
+                f.write(new_conf)
+        except PermissionError:
+            return False, f"Permission denied writing {conf_path}"
+        except Exception as e:
+            return False, f"Failed to write {conf_path}: {e}"
+
+        if log_fn:
+            log_fn(f"[Chrony] Config written to {conf_path}")
 
     # ── Restart chrony ───────────────────────────────────────────────────
     try:
