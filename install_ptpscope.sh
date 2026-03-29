@@ -27,7 +27,7 @@ fi
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════╗"
-echo "  ║       PTPScope Installer v1.2.0          ║"
+echo "  ║       PTPScope Installer v1.3.5          ║"
 echo "  ║     GPS→NTP→PTP Grandmaster Suite        ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -53,6 +53,7 @@ info "Installing as: ${BOLD}${ROLE_LABEL}${NC}"
 NODE_SITE_NAME=""
 NODE_SECRET_KEY=""
 NODE_HUB_URL=""
+GPS_SOURCE_IP=""
 
 if [[ "$NODE_ROLE" != "standalone" ]]; then
     echo ""
@@ -68,6 +69,12 @@ if [[ "$NODE_ROLE" != "standalone" ]]; then
 
     if [[ "$NODE_ROLE" == "gps_source" ]]; then
         read -rp "  PTP Master web UI URL (e.g. http://192.168.1.100:5001): " NODE_HUB_URL
+    fi
+
+    if [[ "$NODE_ROLE" == "ptp_master" ]]; then
+        echo ""
+        read -rp "  GPS Source Pi IP address (for NTP sync, e.g. 192.168.1.50): " GPS_SOURCE_IP
+        GPS_SOURCE_IP="${GPS_SOURCE_IP:-}"
     fi
 fi
 
@@ -101,9 +108,10 @@ PACKAGES=(
     python3-pip
 )
 
-# Role-specific packages
+# Role-specific packages — GPS nodes need pps-tools (but NOT gpsd, PTPScope
+# reads the serial port directly and writes NTP SHM itself)
 if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
-    PACKAGES+=(gpsd gpsd-clients pps-tools)
+    PACKAGES+=(pps-tools)
 fi
 
 if [[ "$NODE_ROLE" == "ptp_master" || "$NODE_ROLE" == "standalone" ]]; then
@@ -118,7 +126,7 @@ for pkg in "${PACKAGES[@]}"; do
     fi
 done
 
-# ── GPS Source: configure UART, GPSD, PPS ────────────────────────────────────
+# ── GPS Source: configure UART, PPS, disable GPSD ────────────────────────────
 if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
     step "Configuring serial UART for GPS HAT"
 
@@ -163,12 +171,12 @@ if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
         fi
     fi
 
-    step "Configuring GPSD"
     # PTPScope reads the GPS serial port directly and writes to NTP SHM
     # itself, so GPSD must be disabled to avoid port conflicts.
-    systemctl stop gpsd gpsd.socket 2>/dev/null
-    systemctl disable gpsd gpsd.socket 2>/dev/null
-    systemctl mask gpsd gpsd.socket 2>/dev/null
+    step "Disabling GPSD (PTPScope handles GPS directly)"
+    systemctl stop gpsd gpsd.socket 2>/dev/null || true
+    systemctl disable gpsd gpsd.socket 2>/dev/null || true
+    systemctl mask gpsd gpsd.socket 2>/dev/null || true
     ok "GPSD disabled (PTPScope writes NTP SHM directly)"
 fi
 
@@ -184,13 +192,15 @@ if [[ -f "$CHRONY_CONF" ]]; then
     cp "$CHRONY_CONF" "${CHRONY_CONF}.ptpscope-backup"
     ok "Backed up ${CHRONY_CONF}"
 
-    if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
-        # GPS Source: use GPS/PPS refclocks, serve NTP to local network
-        if grep -q "refclock SHM 0" "$CHRONY_CONF"; then
-            ok "GPS SHM refclock already configured"
-        else
-            cat >> "$CHRONY_CONF" <<'CHRONYAPPEND'
+    # ── Write chrony config to conf.d (not chrony.conf) ──────────────────
+    # Debian/Ubuntu chrony has a "confdir /etc/chrony/conf.d" directive.
+    # Anything appended to chrony.conf AFTER confdir is silently ignored.
+    # Writing to conf.d ensures our config is always loaded.
+    CHRONY_CONF_DIR="$(dirname "$CHRONY_CONF")/conf.d"
+    mkdir -p "$CHRONY_CONF_DIR"
 
+    if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
+        cat > "${CHRONY_CONF_DIR}/ptpscope.conf" <<'CHRONYCONF'
 # ── PTPScope GPS + PPS configuration ────────────────────────────────────────
 # GPS via shared memory — written by PTPScope directly (not GPSD)
 refclock SHM 0 refid GPS precision 1e-1 offset 0.5 delay 0.2
@@ -200,49 +210,74 @@ refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS prefer
 allow 192.168.0.0/16
 allow 10.0.0.0/8
 allow 172.16.0.0/12
-CHRONYAPPEND
-            ok "GPS SHM + PPS refclocks and NTP server allow rules added"
-        fi
+CHRONYCONF
+        ok "GPS SHM + PPS refclocks written to ${CHRONY_CONF_DIR}/ptpscope.conf"
     fi
 
     if [[ "$NODE_ROLE" == "ptp_master" ]]; then
-        # PTP Master: sync from GPS Source NTP (user will configure hub_url later via web UI)
-        if grep -q "# PTPScope PTP Master" "$CHRONY_CONF"; then
-            ok "PTP Master chrony config already present"
-        else
-            cat >> "$CHRONY_CONF" <<'CHRONYAPPEND'
-
+        if [[ -n "$GPS_SOURCE_IP" ]]; then
+            cat > "${CHRONY_CONF_DIR}/ptpscope.conf" <<EOF
 # ── PTPScope PTP Master configuration ───────────────────────────────────────
-# Primary time source is the GPS Source node's NTP server.
-# Update the server address below to match your GPS Source Pi's IP.
-# server 192.168.1.x iburst prefer
-# makestep 1 3
-CHRONYAPPEND
-            ok "PTP Master chrony stanza added (edit ${CHRONY_CONF} to set GPS Source IP)"
+# Primary time source is the GPS Source node's NTP server
+server ${GPS_SOURCE_IP} iburst prefer
+makestep 1 3
+EOF
+            ok "Chrony configured to sync from GPS Source at ${GPS_SOURCE_IP}"
+        else
+            cat > "${CHRONY_CONF_DIR}/ptpscope.conf" <<'CHRONYCONF'
+# ── PTPScope PTP Master configuration ───────────────────────────────────────
+# Configure the GPS Source IP via the web UI → Settings → Chrony
+makestep 1 3
+CHRONYCONF
+            ok "PTP Master chrony placeholder created — set GPS Source IP in the web UI"
         fi
     fi
 
-    # Chrony runs as _chrony by default, which can't read SHM segments
-    # created by PTPScope (running as root).  Override to run as root.
+    # Clean up any old managed block from chrony.conf (from pre-1.3.4 installs)
+    if grep -q "PTPScope GPS + PPS\|PTPScope PTP Master\|PTPScope managed block" "$CHRONY_CONF" 2>/dev/null; then
+        sed -i '/# ── PTPScope/,/^$/d' "$CHRONY_CONF"
+        sed -i '/# ── PTPScope managed block/,/# ── PTPScope managed block END/d' "$CHRONY_CONF"
+        # Also remove any stray refclock/allow lines we previously appended
+        sed -i '/^refclock SHM 0/d; /^refclock PPS.*lock GPS/d' "$CHRONY_CONF"
+        ok "Cleaned up old PTPScope config from chrony.conf (migrated to conf.d)"
+    fi
+
+    # ── Chrony SHM access: disable seccomp filter ────────────────────────
+    # Chrony's -F 1 flag (set in /etc/default/chrony on Debian) enables
+    # seccomp filtering which prevents reading root-owned SHM segments.
+    # Even running chrony as root doesn't help because -F forces privilege
+    # drop. Disable it so chrony can read PTPScope's NTP SHM.
     if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
-        mkdir -p /etc/systemd/system/chronyd.service.d
-        cat > /etc/systemd/system/chronyd.service.d/ptpscope.conf <<'CHRONYDROP'
+        CHRONY_DEFAULT="/etc/default/chrony"
+        if [[ -f "$CHRONY_DEFAULT" ]] && grep -q "\-F" "$CHRONY_DEFAULT"; then
+            sed -i 's/DAEMON_OPTS=".*-F[^"]*"/DAEMON_OPTS=""/' "$CHRONY_DEFAULT"
+            ok "Disabled chrony seccomp filter (-F) for SHM access"
+        fi
+
+        # Also set up a systemd drop-in to run chrony as root for SHM access
+        CHRONY_DROPIN_DIR=""
+        if [[ -f /usr/lib/systemd/system/chrony.service ]]; then
+            CHRONY_DROPIN_DIR="/etc/systemd/system/chrony.service.d"
+        elif [[ -f /usr/lib/systemd/system/chronyd.service ]]; then
+            CHRONY_DROPIN_DIR="/etc/systemd/system/chronyd.service.d"
+        fi
+        if [[ -n "$CHRONY_DROPIN_DIR" ]]; then
+            mkdir -p "$CHRONY_DROPIN_DIR"
+            cat > "${CHRONY_DROPIN_DIR}/ptpscope.conf" <<'CHRONYDROP'
 [Service]
 User=root
 Group=root
 CHRONYDROP
+            ok "Chrony configured to run as root (for SHM access)"
+        fi
+
         systemctl daemon-reload
-        ok "Chrony configured to run as root (for SHM access)"
     fi
 
-    # On GPS Source nodes the PPS refclock requires /dev/pps0 which only
-    # appears after a reboot (dtoverlay=pps-gpio was just added above).
-    # Chrony will refuse to start until that device exists.
-    # Make /dev/pps0 readable by chrony (_chrony user) via udev rule
+    # ── PPS device permissions ───────────────────────────────────────────
     if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
         echo 'SUBSYSTEM=="pps", MODE="0664", GROUP="_chrony"' > /etc/udev/rules.d/99-pps-chrony.rules
-        udevadm control --reload-rules 2>/dev/null
-        # Fix permissions now if device already exists
+        udevadm control --reload-rules 2>/dev/null || true
         if [[ -e /dev/pps0 ]]; then
             chmod 664 /dev/pps0
             chgrp _chrony /dev/pps0 2>/dev/null || true
@@ -250,10 +285,18 @@ CHRONYDROP
         ok "PPS device permissions set for chrony access"
     fi
 
+    # ── Restart chrony ───────────────────────────────────────────────────
     if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]] && [[ ! -e /dev/pps0 ]]; then
         info "Chrony restart deferred — /dev/pps0 not available until reboot"
     else
-        systemctl restart chronyd 2>/dev/null && ok "Chrony restarted" || warn "Could not restart chrony"
+        # Try both service names (chrony vs chronyd)
+        if systemctl restart chrony 2>/dev/null; then
+            ok "Chrony restarted"
+        elif systemctl restart chronyd 2>/dev/null; then
+            ok "Chrony restarted (chronyd)"
+        else
+            warn "Could not restart chrony — try: sudo systemctl restart chrony"
+        fi
     fi
 else
     warn "Chrony config not found — please configure manually"
@@ -346,6 +389,15 @@ CONFIG_FILE="${INSTALL_ROOT}/ptpscope_config.json"
 
 # Only create if it doesn't exist yet (don't overwrite user's existing config)
 if [[ ! -f "$CONFIG_FILE" ]]; then
+    # GPS/PPS refclocks only for nodes with GPS hardware
+    if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
+        GPS_REFCLOCK="true"
+        PPS_REFCLOCK="true"
+    else
+        GPS_REFCLOCK="false"
+        PPS_REFCLOCK="false"
+    fi
+
     cat > "$CONFIG_FILE" <<EOF
 {
   "node": {
@@ -353,6 +405,12 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     "site_name": "${NODE_SITE_NAME}",
     "secret_key": "${NODE_SECRET_KEY}",
     "hub_url": "${NODE_HUB_URL}"
+  },
+  "chrony": {
+    "gps_refclock": ${GPS_REFCLOCK},
+    "pps_refclock": ${PPS_REFCLOCK},
+    "gps_server_ip": "${GPS_SOURCE_IP}",
+    "makestep": true
   },
   "web_port": 5001,
   "bind_address": "0.0.0.0"
@@ -408,15 +466,6 @@ cat > /etc/systemd/system/ptpscope.service <<EOF
 Description=PTPScope — ${ROLE_LABEL}
 After=network-online.target chrony.service
 Wants=network-online.target
-EOF
-
-if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
-    cat >> /etc/systemd/system/ptpscope.service <<'EOF'
-After=network-online.target gpsd.service chrony.service
-EOF
-fi
-
-cat >> /etc/systemd/system/ptpscope.service <<EOF
 
 [Service]
 Type=simple
@@ -468,28 +517,37 @@ echo ""
 
 if [[ "$NODE_ROLE" == "gps_source" ]]; then
     echo -e "  ${BOLD}Next steps:${NC}"
-    echo -e "    1. On the PTP Master, install PTPScope with role 'PTP Master'"
-    echo -e "    2. Use the same secret key on both machines"
-    echo -e "    3. Set the GPS Source URL in the PTP Master web UI: http://${IP_ADDR}:5001"
-    echo -e "    4. On the PTP Master web UI → Settings → Chrony, enter GPS Source IP: ${IP_ADDR}"
+    echo -e "    1. ${BOLD}Reboot${NC} if prompted above (UART/PPS changes need a reboot)"
+    echo -e "    2. On the PTP Master, install PTPScope with role 'PTP Master'"
+    echo -e "    3. Use the same secret key on both machines"
+    echo -e "    4. Enter this node's IP (${IP_ADDR}) when prompted for GPS Source IP"
     echo ""
 fi
 
 if [[ "$NODE_ROLE" == "ptp_master" ]]; then
     echo -e "  ${BOLD}Next steps:${NC}"
-    echo -e "    1. In the PTPScope web UI → Settings → Chrony, enter the GPS Source IP"
-    echo -e "       (this writes chrony.conf and restarts chrony automatically)"
-    echo -e "    2. In Settings → Node, set the GPS Source secret key"
+    if [[ -n "$GPS_SOURCE_IP" ]]; then
+        echo -e "    1. Chrony is already configured to sync from GPS Source at ${GPS_SOURCE_IP}"
+        echo -e "    2. In the web UI → Settings → Node, set the GPS Source secret key"
+    else
+        echo -e "    1. In the web UI → Settings → Chrony, enter the GPS Source IP"
+        echo -e "       (this writes the config and restarts chrony automatically)"
+        echo -e "    2. In Settings → Node, set the GPS Source secret key"
+    fi
     echo ""
     if [[ -n "${TS_MODE:-}" ]]; then
         echo -e "  ${BOLD}Timestamping:${NC}  ${TS_MODE}"
     fi
+    echo ""
 fi
 
 echo -e "  ${BOLD}Service commands:${NC}"
 echo -e "    sudo systemctl status ptpscope"
 echo -e "    sudo systemctl restart ptpscope"
 echo -e "    sudo journalctl -u ptpscope -f"
+echo ""
+echo -e "  ${BOLD}Update PTPScope:${NC}"
+echo -e "    sudo curl -fsSL -o /opt/ptpscope/ptpscope.py https://raw.githubusercontent.com/itconor/PtPscope/main/ptpscope.py && sudo systemctl restart ptpscope"
 echo ""
 
 if $REBOOT_NEEDED; then
