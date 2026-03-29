@@ -3,7 +3,7 @@
 # PTPScope — GPS PTP Grandmaster for Raspberry Pi
 # Single-file Flask application with embedded templates
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD = "PTPScope-1.3.1"
+BUILD = "PTPScope-1.3.2"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
@@ -1240,22 +1240,34 @@ class NtpShmWriter:
     writes to the same SysV SHM segment that chrony's ``refclock SHM 0``
     reads, giving chrony a coarse-time GPS reference that PPS can lock to.
 
-    SHM layout (96 bytes, see ntpshmread.h in gpsd source):
-        int   mode          offset 0    (must be set to 1)
-        int   count         offset 4    (incremented each update)
-        int   clockTimeStampSec   offset 8
-        int   clockTimeStampUSec  offset 12
-        int   receiveTimeStampSec offset 16
-        int   receiveTimeStampUSec offset 20
-        int   leap          offset 24   (0 = normal)
-        int   precision     offset 28   (-1 = ~0.5 s)
-        int   nsamples      offset 32   (3 for chrony)
-        int   valid         offset 36   (1 when data is ready)
-        ... padding to 96 bytes
+    SHM layout (from chrony refclock_shm.c / gpsd shmexport.c):
+        On 64-bit platforms (aarch64, x86_64) time_t is 8 bytes:
+        int      mode          offset  0   (4 bytes, must be 1)
+        int      count         offset  4   (4 bytes)
+        time_t   clockSec      offset  8   (8 bytes on 64-bit!)
+        int      clockUSec     offset 16   (4 bytes)
+        — 4 bytes padding —              (struct alignment)
+        time_t   recvSec       offset 24   (8 bytes on 64-bit!)
+        int      recvUSec      offset 32   (4 bytes)
+        int      leap          offset 36   (4 bytes, 0 = normal)
+        int      precision     offset 40   (4 bytes, -1 = ~0.5 s)
+        int      nsamples      offset 44   (4 bytes, 3 for chrony)
+        int      valid         offset 48   (4 bytes, 1 when ready)
+        On 32-bit (armv7l) time_t is 4 bytes, all fields are int, valid @ 36.
     """
 
     SHM_KEY = 0x4e545030   # NTP0 — matches chrony "refclock SHM 0"
     SHM_SIZE = 96
+
+    # Detect 64-bit platform: time_t is 8 bytes, struct has padding
+    import ctypes as _ct
+    _IS_64BIT = _ct.sizeof(_ct.c_long) == 8
+    # valid field offset: 48 on 64-bit, 36 on 32-bit
+    _VALID_OFF = 48 if _IS_64BIT else 36
+    # struct pack format: 'l' = time_t (long), 'i' = int
+    # 64-bit: ii l i xxxx l i iiii  (xxxx = 4-byte padding after clockUSec)
+    # 32-bit: iiiiiiiiii
+    _HDR_FMT = "ii" if _IS_64BIT else "ii"
 
     def __init__(self, log_fn):
         self.log = log_fn
@@ -1332,53 +1344,69 @@ class NtpShmWriter:
 
     def write(self, clock_sec: int, clock_usec: int,
               recv_sec: int, recv_usec: int):
-        """Write a GPS time sample to SHM for chrony to read."""
+        """Write a GPS time sample to SHM for chrony to read.
+
+        The struct layout depends on the platform word size:
+          64-bit (aarch64/x86_64): time_t = 8 bytes, valid at offset 48
+          32-bit (armv7l):         time_t = 4 bytes, valid at offset 36
+        """
         if not self._attached:
             return
         import struct
         self._count += 1
-        # NTP SHM protocol (mode 1):
-        #   1. Writer sets valid=0
-        #   2. Writer updates clock/receive timestamps and increments count
-        #   3. Writer sets valid=1
-        # Chrony reads: if valid==1 and count changed, grab data, set valid=0
+
+        if self._IS_64BIT:
+            # struct shmTime on 64-bit:
+            #   int mode(4) + int count(4) + time_t clockSec(8) +
+            #   int clockUSec(4) + 4-pad + time_t recvSec(8) +
+            #   int recvUSec(4) + int leap(4) + int precision(4) +
+            #   int nsamples(4) + int valid(4)
+            # Use native struct packing with '@' to get correct alignment
+            fmt = "@ii q i xxxx q i iiii"
+            data_size = struct.calcsize(fmt)
+        else:
+            # 32-bit: all fields are int (4 bytes)
+            fmt = "@iiiiiiiiii"
+            data_size = struct.calcsize(fmt)
+
         if hasattr(self, '_use_ctypes') and self._use_ctypes:
             import ctypes
             # Step 1: set valid=0
             _zero = struct.pack("i", 0)
             _zbuf = (ctypes.c_byte * 4)(*_zero)
-            ctypes.memmove(self._shm + 36, _zbuf, 4)
-            # Step 2: write all fields
-            buf = (ctypes.c_byte * self.SHM_SIZE)()
-            struct.pack_into("iiiiiiiiii", buf, 0,
-                             1,               # mode (1 = simple valid-flag protocol)
-                             self._count,      # count
-                             clock_sec,        # clockTimeStampSec
-                             clock_usec,       # clockTimeStampUSec
-                             recv_sec,         # receiveTimeStampSec
-                             recv_usec,        # receiveTimeStampUSec
-                             0,               # leap (normal)
-                             -1,              # precision (~0.5 s)
-                             3,               # nsamples
-                             0)               # valid (will set to 1 below)
-            ctypes.memmove(self._shm, buf, 36)  # write up to valid
+            ctypes.memmove(self._shm + self._VALID_OFF, _zbuf, 4)
+            # Step 2: write all fields (valid=0 in the packed data)
+            packed = struct.pack(fmt,
+                                 1,               # mode
+                                 self._count,      # count
+                                 clock_sec,        # clockTimeStampSec (time_t)
+                                 clock_usec,       # clockTimeStampUSec
+                                                   # (4-byte padding on 64-bit)
+                                 recv_sec,         # receiveTimeStampSec (time_t)
+                                 recv_usec,        # receiveTimeStampUSec
+                                 0,               # leap
+                                 -1,              # precision
+                                 3,               # nsamples
+                                 0)               # valid (set to 1 below)
+            buf = (ctypes.c_byte * len(packed))(*packed)
+            ctypes.memmove(self._shm, buf, self._VALID_OFF)  # write up to valid
             # Step 3: set valid=1
             _one = struct.pack("i", 1)
             _obuf = (ctypes.c_byte * 4)(*_one)
-            ctypes.memmove(self._shm + 36, _obuf, 4)
+            ctypes.memmove(self._shm + self._VALID_OFF, _obuf, 4)
         else:
             # sysv_ipc path
             # Step 1: clear valid
-            self._shm.write(struct.pack("i", 0), 36)
+            self._shm.write(struct.pack("i", 0), self._VALID_OFF)
             # Step 2: write fields
-            data = struct.pack("iiiiiiiii",
-                               1, self._count,
-                               clock_sec, clock_usec,
-                               recv_sec, recv_usec,
-                               0, -1, 3)
-            self._shm.write(data, 0)
+            packed = struct.pack(fmt,
+                                 1, self._count,
+                                 clock_sec, clock_usec,
+                                 recv_sec, recv_usec,
+                                 0, -1, 3, 0)
+            self._shm.write(packed[:self._VALID_OFF], 0)
             # Step 3: set valid=1
-            self._shm.write(struct.pack("i", 1), 36)
+            self._shm.write(struct.pack("i", 1), self._VALID_OFF)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
