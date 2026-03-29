@@ -193,9 +193,9 @@ if [[ -f "$CHRONY_CONF" ]]; then
 
 # ── PTPScope GPS + PPS configuration ────────────────────────────────────────
 # GPS via shared memory — written by PTPScope directly (not GPSD)
-refclock SHM 0 refid GPS precision 1e-1 offset 0.0 delay 0.2 noselect
+refclock SHM 0 refid GPS precision 1e-1 offset 0.5 delay 0.2
 # PPS from kernel PPS driver — locked to GPS for coarse time
-refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS
+refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS prefer
 # Allow NTP clients on local network
 allow 192.168.0.0/16
 allow 10.0.0.0/8
@@ -238,6 +238,18 @@ CHRONYDROP
     # On GPS Source nodes the PPS refclock requires /dev/pps0 which only
     # appears after a reboot (dtoverlay=pps-gpio was just added above).
     # Chrony will refuse to start until that device exists.
+    # Make /dev/pps0 readable by chrony (_chrony user) via udev rule
+    if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]]; then
+        echo 'SUBSYSTEM=="pps", MODE="0664", GROUP="_chrony"' > /etc/udev/rules.d/99-pps-chrony.rules
+        udevadm control --reload-rules 2>/dev/null
+        # Fix permissions now if device already exists
+        if [[ -e /dev/pps0 ]]; then
+            chmod 664 /dev/pps0
+            chgrp _chrony /dev/pps0 2>/dev/null || true
+        fi
+        ok "PPS device permissions set for chrony access"
+    fi
+
     if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]] && [[ ! -e /dev/pps0 ]]; then
         info "Chrony restart deferred — /dev/pps0 not available until reboot"
     else

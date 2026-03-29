@@ -3,7 +3,7 @@
 # PTPScope — GPS PTP Grandmaster for Raspberry Pi
 # Single-file Flask application with embedded templates
 # ─────────────────────────────────────────────────────────────────────────────
-BUILD = "PTPScope-1.3.2"
+BUILD = "PTPScope-1.3.3"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
@@ -1916,11 +1916,11 @@ def _apply_chrony_config(chrony_cfg: ChronyConfig, log_fn=None):
 
     # GPS SHM refclock
     if chrony_cfg.gps_refclock:
-        lines.append("refclock SHM 0 refid GPS precision 1e-1 offset 0.0 delay 0.2 noselect")
+        lines.append("refclock SHM 0 refid GPS precision 1e-1 offset 0.5 delay 0.2")
 
     # PPS refclock
     if chrony_cfg.pps_refclock:
-        lines.append("refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS")
+        lines.append("refclock PPS /dev/pps0 refid PPS precision 1e-7 lock GPS prefer")
 
     # GPS Source server (PTP Master pointing at a GPS Pi)
     if chrony_cfg.gps_server_ip and chrony_cfg.gps_server_ip.strip():
