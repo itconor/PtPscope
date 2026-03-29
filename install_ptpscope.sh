@@ -226,7 +226,14 @@ CHRONYAPPEND
         fi
     fi
 
-    systemctl restart chrony 2>/dev/null && ok "Chrony restarted" || warn "Could not restart chrony"
+    # On GPS Source nodes the PPS refclock requires /dev/pps0 which only
+    # appears after a reboot (dtoverlay=pps-gpio was just added above).
+    # Chrony will refuse to start until that device exists.
+    if [[ "$NODE_ROLE" == "gps_source" || "$NODE_ROLE" == "standalone" ]] && [[ ! -e /dev/pps0 ]]; then
+        info "Chrony restart deferred — /dev/pps0 not available until reboot"
+    else
+        systemctl restart chrony 2>/dev/null && ok "Chrony restarted" || warn "Could not restart chrony"
+    fi
 else
     warn "Chrony config not found — please configure manually"
 fi
